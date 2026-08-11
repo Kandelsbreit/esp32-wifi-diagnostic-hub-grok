@@ -9,11 +9,11 @@
  *  - SoftAP "ESP32-Diag-Hub"
  *  - Full web dashboard with dark theme
  *  - Live WebSocket telemetry
- *  - Wi-Fi network scanner
- *  - System & chip info
+ *  - Asynchronous Wi-Fi network scanner
+ *  - System & chip info + connected clients
  *  - Circular event log
  *  - OTA via web
- *  - HTTP Basic Auth
+ *  - HTTP Basic Auth + reboot
  *  - FreeRTOS monitoring task
  */
 
@@ -26,6 +26,9 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <esp_chip_info.h>
+#include <vector>
+#include <cstdarg>
+#include <algorithm>
 
 // ===================== CONFIG =====================
 const char* AP_SSID     = "ESP32-Diag-Hub";
@@ -34,15 +37,15 @@ const char* AP_PASSWORD = "diagnostic123";
 const char* AUTH_USER   = "admin";
 const char* AUTH_PASS   = "grok2026";
 
-const int   WS_INTERVAL_MS = 1500;   // WebSocket push interval
-const int   LOG_CAPACITY   = 40;     // circular log size
+const int   WS_INTERVAL_MS = 1500;
+const int   LOG_CAPACITY   = 50;
 
 // ===================== GLOBALS =====================
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
 struct LogEntry {
-  unsigned long ts;      // millis
+  unsigned long ts;
   char msg[96];
 };
 
@@ -52,6 +55,7 @@ int logCount = 0;
 
 struct ScanResult {
   String ssid;
+  String bssid;
   int32_t rssi;
   uint8_t channel;
   wifi_auth_mode_t enc;
@@ -59,18 +63,18 @@ struct ScanResult {
 };
 
 std::vector<ScanResult> lastScan;
-bool scanInProgress = false;
+volatile bool scanInProgress = false;
+volatile bool scanRequested = false;
 unsigned long lastScanTime = 0;
+int lastScanCount = 0;
 
-// Live stats
 struct {
   uint32_t freeHeap;
   uint32_t minFreeHeap;
   uint32_t uptimeSec;
-  int8_t   rssi;          // if connected as STA (optional)
   uint8_t  apClients;
   uint32_t wifiChannel;
-  float    temperature;   // internal sensor approx
+  float    temperature;
 } liveStats;
 
 // ===================== UTILS =====================
@@ -83,7 +87,7 @@ void addLog(const char* fmt, ...) {
 
   logBuf[logHead].ts = millis();
   strncpy(logBuf[logHead].msg, buf, sizeof(logBuf[logHead].msg) - 1);
-  logBuf[logHead].msg[sizeof(logBuf[logHead].msg) - 1] = 0;
+  logBuf[logHead].msg[sizeof(logBuf[logHead].msg) - 1] = '\0';
 
   logHead = (logHead + 1) % LOG_CAPACITY;
   if (logCount < LOG_CAPACITY) logCount++;
@@ -93,15 +97,15 @@ void addLog(const char* fmt, ...) {
 
 String authModeToStr(wifi_auth_mode_t m) {
   switch (m) {
-    case WIFI_AUTH_OPEN:         return "OPEN";
-    case WIFI_AUTH_WEP:          return "WEP";
-    case WIFI_AUTH_WPA_PSK:      return "WPA";
-    case WIFI_AUTH_WPA2_PSK:     return "WPA2";
-    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_OPEN:            return "OPEN";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
     case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
-    case WIFI_AUTH_WPA3_PSK:     return "WPA3";
-    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
-    default:                     return "?";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+    default:                        return "?";
   }
 }
 
@@ -113,15 +117,20 @@ bool checkAuth(AsyncWebServerRequest *request) {
   return true;
 }
 
-// ===================== LIVE STATS TASK =====================
+// ===================== LIVE STATS =====================
 void updateLiveStats() {
   liveStats.freeHeap    = ESP.getFreeHeap();
   liveStats.minFreeHeap = ESP.getMinFreeHeap();
-  liveStats.uptimeSec   = millis() / 1000;
+  liveStats.uptimeSec   = millis() / 1000UL;
   liveStats.apClients   = WiFi.softAPgetStationNum();
   liveStats.wifiChannel = WiFi.channel();
-  // Internal temperature (rough, ESP32)
-  liveStats.temperature = temperatureRead();
+
+  // temperatureRead() is approximate and not available on every core revision
+  #ifdef CONFIG_IDF_TARGET_ESP32
+    liveStats.temperature = temperatureRead();
+  #else
+    liveStats.temperature = 0.0f;
+  #endif
 }
 
 void broadcastStats() {
@@ -130,48 +139,94 @@ void broadcastStats() {
   updateLiveStats();
 
   JsonDocument doc;
-  doc["type"] = "stats";
-  doc["freeHeap"] = liveStats.freeHeap;
-  doc["minFreeHeap"] = liveStats.minFreeHeap;
-  doc["uptime"] = liveStats.uptimeSec;
-  doc["apClients"] = liveStats.apClients;
-  doc["channel"] = liveStats.wifiChannel;
-  doc["temp"] = liveStats.temperature;
+  doc["type"]           = "stats";
+  doc["freeHeap"]       = liveStats.freeHeap;
+  doc["minFreeHeap"]    = liveStats.minFreeHeap;
+  doc["uptime"]         = liveStats.uptimeSec;
+  doc["apClients"]      = liveStats.apClients;
+  doc["channel"]        = liveStats.wifiChannel;
+  doc["temp"]           = liveStats.temperature;
   doc["scanInProgress"] = scanInProgress;
-  doc["lastScanAge"] = lastScanTime ? (millis() - lastScanTime) / 1000 : -1;
+  doc["lastScanAge"]    = lastScanTime ? (millis() - lastScanTime) / 1000UL : -1;
+  doc["lastScanCount"]  = lastScanCount;
 
   String json;
   serializeJson(doc, json);
   ws.textAll(json);
 }
 
-// ===================== SCANNER =====================
-void doScan() {
-  if (scanInProgress) return;
-  scanInProgress = true;
-  addLog("Wi-Fi scan started...");
+// ===================== ASYNC SCANNER =====================
+void processScan() {
+  if (!scanRequested && !scanInProgress) return;
 
-  // Run in separate task-ish (async)
-  int n = WiFi.scanNetworks(false, true); // async=false, show_hidden=true
-  lastScan.clear();
-
-  for (int i = 0; i < n; ++i) {
-    ScanResult r;
-    r.ssid    = WiFi.SSID(i);
-    r.rssi    = WiFi.RSSI(i);
-    r.channel = WiFi.channel(i);
-    r.enc     = WiFi.encryptionType(i);
-    r.isHidden = (r.ssid.length() == 0);
-    lastScan.push_back(r);
+  if (scanRequested && !scanInProgress) {
+    scanRequested = false;
+    scanInProgress = true;
+    lastScan.clear();
+    addLog("Wi-Fi scan started (async)");
+    // true = async mode
+    WiFi.scanNetworks(true, true); // async, show_hidden
   }
 
-  WiFi.scanDelete();
-  lastScanTime = millis();
-  scanInProgress = false;
-  addLog("Scan finished: %d networks found", n);
+  if (scanInProgress) {
+    int16_t n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) {
+      return; // still running
+    }
+
+    // finished or failed
+    if (n >= 0) {
+      lastScan.clear();
+      lastScan.reserve(n);
+
+      for (int i = 0; i < n; ++i) {
+        ScanResult r;
+        r.ssid     = WiFi.SSID(i);
+        r.bssid    = WiFi.BSSIDstr(i);
+        r.rssi     = WiFi.RSSI(i);
+        r.channel  = WiFi.channel(i);
+        r.enc      = WiFi.encryptionType(i);
+        r.isHidden = (r.ssid.length() == 0);
+        lastScan.push_back(r);
+      }
+
+      // sort by RSSI descending
+      std::sort(lastScan.begin(), lastScan.end(),
+                [](const ScanResult& a, const ScanResult& b) {
+                  return a.rssi > b.rssi;
+                });
+
+      lastScanCount = n;
+      lastScanTime = millis();
+      addLog("Scan finished: %d networks", n);
+    } else {
+      addLog("Scan failed or aborted");
+      lastScanCount = 0;
+    }
+
+    WiFi.scanDelete();
+    scanInProgress = false;
+
+    // notify clients via WS
+    broadcastStats();
+  }
 }
 
-// ===================== WEB UI (embedded) =====================
+// ===================== CONNECTED CLIENTS =====================
+void getConnectedClients(JsonArray& arr) {
+  wifi_sta_list_t staList;
+  if (esp_wifi_ap_get_sta_list(&staList) != ESP_OK) return;
+
+  for (int i = 0; i < staList.num; i++) {
+    char macStr[18];
+    uint8_t* m = staList.sta[i].mac;
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+    arr.add(macStr);
+  }
+}
+
+// ===================== WEB UI =====================
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="ru">
@@ -259,7 +314,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
     gap: 10px;
   }
   .stat {
@@ -269,7 +324,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     text-align: center;
   }
   .stat .val {
-    font-size: 1.4rem;
+    font-size: 1.35rem;
     font-weight: 700;
     color: var(--accent);
   }
@@ -281,10 +336,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.88rem;
+    font-size: 0.85rem;
   }
   th, td {
-    padding: 8px 10px;
+    padding: 7px 8px;
     text-align: left;
     border-bottom: 1px solid var(--border);
   }
@@ -306,8 +361,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     opacity: 0.5;
     cursor: not-allowed;
   }
+  button.danger {
+    background: var(--red);
+    color: white;
+  }
   .log-list {
-    max-height: 320px;
+    max-height: 340px;
     overflow-y: auto;
     font-family: ui-monospace, monospace;
     font-size: 0.8rem;
@@ -336,6 +395,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     font-size: 0.9rem;
   }
   .info-row span:first-child { color: var(--muted); }
+  .client-list {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    color: var(--green);
+  }
 </style>
 </head>
 <body>
@@ -356,7 +420,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </nav>
 
 <main>
-  <!-- DASHBOARD -->
   <section id="tab-dash">
     <div class="card">
       <h2>Live Telemetry</h2>
@@ -375,9 +438,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="info-row"><span>IP</span><span>192.168.4.1</span></div>
       <div class="info-row"><span>Password</span><span>diagnostic123</span></div>
     </div>
+    <div class="card">
+      <h2>Connected Clients</h2>
+      <div id="client-list" class="client-list">—</div>
+    </div>
   </section>
 
-  <!-- SCANNER -->
   <section id="tab-scan" class="hidden">
     <div class="card">
       <h2>Wi-Fi Scanner</h2>
@@ -385,11 +451,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <p style="margin-top:10px;color:var(--muted);font-size:0.85rem" id="scan-status">Ready</p>
     </div>
     <div class="card">
-      <h2>Results</h2>
+      <h2>Results <span id="scan-count" style="color:var(--accent)"></span></h2>
       <div style="overflow-x:auto">
         <table>
           <thead>
-            <tr><th>SSID</th><th>RSSI</th><th>Ch</th><th>Auth</th></tr>
+            <tr><th>SSID</th><th>RSSI</th><th>Ch</th><th>Auth</th><th>BSSID</th></tr>
           </thead>
           <tbody id="scan-body"></tbody>
         </table>
@@ -397,15 +463,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
   </section>
 
-  <!-- SYSTEM -->
   <section id="tab-sys" class="hidden">
     <div class="card">
       <h2>Chip & Firmware</h2>
       <div id="sys-info">Loading...</div>
     </div>
+    <div class="card">
+      <h2>Actions</h2>
+      <button class="action danger" onclick="doReboot()">Reboot Device</button>
+      <p style="margin-top:8px;color:var(--muted);font-size:0.85rem">Requires auth (admin / grok2026)</p>
+    </div>
   </section>
 
-  <!-- LOGS -->
   <section id="tab-logs" class="hidden">
     <div class="card">
       <h2>Event Log</h2>
@@ -413,7 +482,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
   </section>
 
-  <!-- OTA -->
   <section id="tab-ota" class="hidden">
     <div class="card">
       <h2>Firmware Update (OTA)</h2>
@@ -448,6 +516,7 @@ tabs.forEach(btn => {
     sections[btn.dataset.tab].classList.remove('hidden');
     if (btn.dataset.tab === 'sys') loadSys();
     if (btn.dataset.tab === 'logs') loadLogs();
+    if (btn.dataset.tab === 'dash') loadClients();
   });
 });
 
@@ -464,13 +533,12 @@ function rssiClass(r) {
   return 'rssi-bad';
 }
 
-// WebSocket
 let ws;
+let scanPollTimer = null;
+
 function connectWS() {
   ws = new WebSocket('ws://' + location.host + '/ws');
-  ws.onopen = () => {
-    document.getElementById('statusDot').classList.add('ok');
-  };
+  ws.onopen = () => document.getElementById('statusDot').classList.add('ok');
   ws.onclose = () => {
     document.getElementById('statusDot').classList.remove('ok');
     setTimeout(connectWS, 2000);
@@ -483,12 +551,18 @@ function connectWS() {
       document.getElementById('s-uptime').textContent = fmtUptime(d.uptime);
       document.getElementById('s-clients').textContent = d.apClients;
       document.getElementById('s-ch').textContent = d.channel;
-      document.getElementById('s-temp').textContent = d.temp.toFixed(1);
+      document.getElementById('s-temp').textContent = d.temp ? d.temp.toFixed(1) : 'n/a';
+
       if (d.scanInProgress) {
         document.getElementById('scan-status').textContent = 'Scanning...';
         document.getElementById('btn-scan').disabled = true;
       } else {
         document.getElementById('btn-scan').disabled = false;
+        if (scanPollTimer) {
+          clearInterval(scanPollTimer);
+          scanPollTimer = null;
+          loadScanResults();
+        }
       }
     }
   };
@@ -497,8 +571,27 @@ connectWS();
 
 function startScan() {
   document.getElementById('btn-scan').disabled = true;
-  document.getElementById('scan-status').textContent = 'Scanning...';
+  document.getElementById('scan-status').textContent = 'Starting scan...';
   fetch('/api/scan', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'started' || data.status === 'already') {
+        document.getElementById('scan-status').textContent = 'Scanning...';
+        // poll until finished (WS also notifies)
+        if (scanPollTimer) clearInterval(scanPollTimer);
+        scanPollTimer = setInterval(() => {
+          // just wait for WS to clear scanInProgress
+        }, 800);
+      }
+    })
+    .catch(err => {
+      document.getElementById('scan-status').textContent = 'Error: ' + err;
+      document.getElementById('btn-scan').disabled = false;
+    });
+}
+
+function loadScanResults() {
+  fetch('/api/scan/results')
     .then(r => r.json())
     .then(data => {
       const tbody = document.getElementById('scan-body');
@@ -508,14 +601,12 @@ function startScan() {
         tr.innerHTML = `<td>${n.ssid || '<i>hidden</i>'}</td>
                         <td class="${rssiClass(n.rssi)}">${n.rssi} dBm</td>
                         <td>${n.channel}</td>
-                        <td>${n.auth}</td>`;
+                        <td>${n.auth}</td>
+                        <td style="font-size:0.75rem;color:var(--muted)">${n.bssid || ''}</td>`;
         tbody.appendChild(tr);
       });
-      document.getElementById('scan-status').textContent = `Found ${data.networks.length} networks`;
-      document.getElementById('btn-scan').disabled = false;
-    })
-    .catch(err => {
-      document.getElementById('scan-status').textContent = 'Error: ' + err;
+      document.getElementById('scan-count').textContent = '(' + data.networks.length + ')';
+      document.getElementById('scan-status').textContent = 'Found ' + data.networks.length + ' networks';
       document.getElementById('btn-scan').disabled = false;
     });
 }
@@ -552,10 +643,37 @@ function loadLogs() {
     });
 }
 
-// OTA form progress (basic)
-document.getElementById('ota-form').addEventListener('submit', function(e) {
+function loadClients() {
+  fetch('/api/clients')
+    .then(r => r.json())
+    .then(d => {
+      const el = document.getElementById('client-list');
+      if (!d.clients || d.clients.length === 0) {
+        el.textContent = 'No clients connected';
+      } else {
+        el.innerHTML = d.clients.map(m => `<div>${m}</div>`).join('');
+      }
+    });
+}
+
+function doReboot() {
+  if (!confirm('Reboot the ESP32 now?')) return;
+  fetch('/api/reboot', { method: 'POST' })
+    .then(r => {
+      if (r.status === 401) {
+        alert('Auth required');
+        return;
+      }
+      document.getElementById('sys-info').innerHTML += '<p style="color:var(--orange)">Rebooting...</p>';
+    });
+}
+
+document.getElementById('ota-form').addEventListener('submit', function() {
   document.getElementById('ota-status').textContent = 'Uploading... do not power off';
 });
+
+// initial clients load
+setTimeout(loadClients, 800);
 </script>
 </body>
 </html>
@@ -563,26 +681,24 @@ document.getElementById('ota-form').addEventListener('submit', function(e) {
 
 // ===================== HTTP HANDLERS =====================
 void setupWeb() {
-  // Main page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", INDEX_HTML);
   });
 
-  // API: system info
   server.on("/api/system", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     esp_chip_info_t chip;
     esp_chip_info(&chip);
 
-    doc["model"] = ESP.getChipModel();
-    doc["cores"] = chip.cores;
-    doc["revision"] = chip.revision;
-    doc["cpuMHz"] = ESP.getCpuFreqMHz();
-    doc["flashMB"] = ESP.getFlashChipSize() / (1024 * 1024);
-    doc["sdk"] = ESP.getSdkVersion();
-    doc["arduino"] = ESP.getCoreVersion();
-    doc["macSTA"] = WiFi.macAddress();
-    doc["macAP"] = WiFi.softAPmacAddress();
+    doc["model"]      = ESP.getChipModel();
+    doc["cores"]      = chip.cores;
+    doc["revision"]   = chip.revision;
+    doc["cpuMHz"]     = ESP.getCpuFreqMHz();
+    doc["flashMB"]    = ESP.getFlashChipSize() / (1024 * 1024);
+    doc["sdk"]        = ESP.getSdkVersion();
+    doc["arduino"]    = ESP.getCoreVersion();
+    doc["macSTA"]     = WiFi.macAddress();
+    doc["macAP"]      = WiFi.softAPmacAddress();
     doc["sketchSize"] = ESP.getSketchSize();
     doc["freeSketch"] = ESP.getFreeSketchSpace();
 
@@ -591,20 +707,19 @@ void setupWeb() {
     request->send(200, "application/json", json);
   });
 
-  // API: logs
   server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     JsonArray arr = doc["logs"].to<JsonArray>();
 
-    // oldest → newest
     int start = (logCount == LOG_CAPACITY) ? logHead : 0;
     for (int i = 0; i < logCount; i++) {
       int idx = (start + i) % LOG_CAPACITY;
       JsonObject o = arr.add<JsonObject>();
-      unsigned long sec = logBuf[idx].ts / 1000;
+      unsigned long sec = logBuf[idx].ts / 1000UL;
       char tbuf[16];
-      snprintf(tbuf, sizeof(tbuf), "%02lu:%02lu:%02lu", (sec/3600)%24, (sec/60)%60, sec%60);
-      o["ts"] = tbuf;
+      snprintf(tbuf, sizeof(tbuf), "%02lu:%02lu:%02lu",
+               (sec / 3600) % 24, (sec / 60) % 60, sec % 60);
+      o["ts"]  = tbuf;
       o["msg"] = logBuf[idx].msg;
     }
 
@@ -613,23 +728,29 @@ void setupWeb() {
     request->send(200, "application/json", json);
   });
 
-  // API: start scan
+  // Start async scan
   server.on("/api/scan", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (scanInProgress) {
-      request->send(409, "application/json", "{\"error\":\"scan in progress\"}");
+      request->send(200, "application/json", "{\"status\":\"already\"}");
       return;
     }
-    doScan();
+    scanRequested = true;
+    request->send(200, "application/json", "{\"status\":\"started\"}");
+  });
 
+  // Get last scan results
+  server.on("/api/scan/results", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     JsonArray arr = doc["networks"].to<JsonArray>();
-    for (auto& r : lastScan) {
+
+    for (const auto& r : lastScan) {
       JsonObject o = arr.add<JsonObject>();
-      o["ssid"] = r.ssid;
-      o["rssi"] = r.rssi;
-      o["channel"] = r.channel;
-      o["auth"] = authModeToStr(r.enc);
-      o["hidden"] = r.isHidden;
+      o["ssid"]   = r.ssid;
+      o["bssid"]  = r.bssid;
+      o["rssi"]   = r.rssi;
+      o["channel"]= r.channel;
+      o["auth"]   = authModeToStr(r.enc);
+      o["hidden"]= r.isHidden;
     }
 
     String json;
@@ -637,7 +758,27 @@ void setupWeb() {
     request->send(200, "application/json", json);
   });
 
-  // OTA update
+  // Connected clients
+  server.on("/api/clients", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    JsonArray arr = doc["clients"].to<JsonArray>();
+    getConnectedClients(arr);
+
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // Reboot (protected)
+  server.on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    addLog("Reboot requested via web");
+    request->send(200, "text/plain", "Rebooting...");
+    delay(400);
+    ESP.restart();
+  });
+
+  // OTA
   server.on("/update", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       if (!checkAuth(request)) return;
@@ -647,12 +788,14 @@ void setupWeb() {
       response->addHeader("Connection", "close");
       request->send(response);
       if (ok) {
-        delay(500);
+        delay(600);
         ESP.restart();
       }
     },
     [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-      if (!request->authenticate(AUTH_USER, AUTH_PASS)) return;
+      if (!request->authenticate(AUTH_USER, AUTH_PASS)) {
+        return;
+      }
 
       if (index == 0) {
         addLog("OTA start: %s", filename.c_str());
@@ -676,12 +819,11 @@ void setupWeb() {
     }
   );
 
-  // WebSocket events
   ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client,
                 AwsEventType type, void *arg, uint8_t *data, size_t len) {
     if (type == WS_EVT_CONNECT) {
       addLog("WS client #%u connected", client->id());
-      broadcastStats(); // immediate
+      broadcastStats();
     } else if (type == WS_EVT_DISCONNECT) {
       addLog("WS client #%u disconnected", client->id());
     }
@@ -695,24 +837,26 @@ void setupWeb() {
 // ===================== SETUP & LOOP =====================
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(200);
   Serial.println("\n\n=== ESP32 Wi-Fi Diagnostic Hub (Grok) ===");
 
-  // SoftAP only (no STA needed)
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  delay(100);
+  // Optional: fix channel for more stable AP during scans
+  // WiFi.softAPConfig(...);
+  bool apOk = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  delay(150);
 
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("AP SSID: %s\n", AP_SSID);
-  Serial.printf("AP IP  : %s\n", ip.toString().c_str());
+  Serial.printf("AP SSID : %s\n", AP_SSID);
+  Serial.printf("AP IP   : %s\n", ip.toString().c_str());
+  Serial.printf("AP started: %s\n", apOk ? "OK" : "FAIL");
 
-  addLog("Boot complete, SoftAP up");
+  addLog("Boot complete, SoftAP %s", apOk ? "up" : "FAILED");
   addLog("Free heap at boot: %u", ESP.getFreeHeap());
 
   setupWeb();
 
-  // Optional: create a FreeRTOS task for stats (demonstrates multi-tasking)
+  // FreeRTOS task for live stats broadcast
   xTaskCreatePinnedToCore(
     [](void* param) {
       for (;;) {
@@ -725,12 +869,12 @@ void setup() {
     nullptr,
     1,
     nullptr,
-    0   // core 0
+    0
   );
 }
 
 void loop() {
-  // Clean up disconnected WS clients
+  processScan();          // handle async scan state machine
   ws.cleanupClients();
-  delay(50);
+  delay(30);
 }
